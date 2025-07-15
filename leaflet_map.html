@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Leaflet Geo Map</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <style>
+        html, body, #map {
+            height: 100%;
+            width: 100%;
+            margin: 0;
+            padding: 0;
+            background-color: #f0f0f0;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script>
+        let map = null;
+        let coverageCircle = null;
+
+        function initializeMap(lat, lon, zoom) {
+            if (map) {
+                map.remove();
+            }
+            map = L.map('map', {
+                attributionControl: false,
+                zoomControl: true,
+                dragging: true,
+                scrollWheelZoom: true,
+                doubleClickZoom: true,
+            }).setView([lat, lon], zoom);
+
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
+            }).addTo(map);
+        }
+
+        function showCoverageCircle(lat, lon, radiusMeters) {
+            if (coverageCircle) {
+                map.removeLayer(coverageCircle);
+            }
+            coverageCircle = L.circle([lat, lon], {
+                radius: radiusMeters / 2, // radius is half the width
+                color: 'red',
+                fillColor: 'red',
+                fillOpacity: 0.3,
+                weight: 2
+            }).addTo(map);
+        }
+    </script>
+</body>
+</html> 
