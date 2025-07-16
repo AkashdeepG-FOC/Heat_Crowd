@@ -69,6 +69,12 @@ A modern PyQt5 desktop application for real-time crowd counting, density estimat
 
 ---
 
+## Screenshot
+
+![App Screenshot](image.png)
+
+---
+
 ## Requirements
 
 - Python 3.7+
