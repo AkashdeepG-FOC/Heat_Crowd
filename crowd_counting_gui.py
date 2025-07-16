@@ -7,11 +7,14 @@ import os
 import json
 from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, 
                             QFileDialog, QHBoxLayout, QCheckBox, QGroupBox, QFormLayout, 
-                            QButtonGroup, QRadioButton, QFrame, QLineEdit)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
-from PyQt5.QtGui import QImage, QPixmap, QFont, QCursor
+                            QButtonGroup, QRadioButton, QFrame, QLineEdit, QInputDialog, QMessageBox, QDialog, QComboBox, QDialogButtonBox)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint, QRect
+from PyQt5.QtGui import QImage, QPixmap, QFont, QCursor, QPainter, QPen
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from ultralytics import YOLO
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+import datetime
 
 COCO_CLASSES = [
     'person', 'bicycle', 'car', 'motorbike', 'aeroplane', 'bus', 'train', 'truck',
@@ -29,9 +32,9 @@ COCO_CLASSES = [
 ]
 
 class VideoThread(QThread):
-    change_pixmap_signal = pyqtSignal(np.ndarray, np.ndarray, np.ndarray, int, float, float, bool, float, int, list)
+    change_pixmap_signal = pyqtSignal(np.ndarray, np.ndarray, np.ndarray, int, float, float, bool, float, int)
 
-    def __init__(self, video_path, conf_thresh=0.10, iou_thresh=0.6, max_people=350, overcrowd_thresh=80.0, light_mode=False):
+    def __init__(self, video_path, conf_thresh=0.10, iou_thresh=0.6, max_people=350, overcrowd_thresh=80.0, light_mode=False, zones=[], zone_counting_enabled=False):
         super().__init__()
         self.video_path = video_path
         self.conf_thresh = conf_thresh
@@ -45,6 +48,8 @@ class VideoThread(QThread):
         self.peak_density = 0.0
         self.alerts_triggered = 0
         self.light_mode = light_mode
+        self.zones = zones
+        self.zone_counting_enabled = zone_counting_enabled
 
     def run(self):
         cap = cv2.VideoCapture(self.video_path)
@@ -85,29 +90,49 @@ class VideoThread(QThread):
             class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
             confidences = results[0].boxes.conf.cpu().numpy()
             
-            current_people_count = sum(1 for i, class_id in enumerate(class_ids)
-                                     if COCO_CLASSES[class_id] == 'person' and confidences[i] > self.conf_thresh)
-            
-            crowd_percentage = (current_people_count / self.max_people) * 100 if self.max_people > 0 else 0
-            
-            # Update peak density
-            if crowd_percentage > self.peak_density:
-                self.peak_density = crowd_percentage
-
             # Create detection frame with bounding boxes
             detection_frame = frame.copy()
+
+            # --- Zone-based counting logic ---
+            people_in_zones = 0
+            all_people_count = 0
             
-            # Update heatmap
+            # Update heatmap based on ALL people for a complete thermal view
             for i, class_id in enumerate(class_ids):
                 if COCO_CLASSES[class_id] == 'person' and confidences[i] > self.conf_thresh:
                     x1, y1, x2, y2 = map(int, boxes[i])
                     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                     cv2.circle(self.heatmap, (cx, cy), 20, 1, -1)
+
+            for i, class_id in enumerate(class_ids):
+                if COCO_CLASSES[class_id] == 'person' and confidences[i] > self.conf_thresh:
+                    all_people_count += 1
+                    x1, y1, x2, y2 = map(int, boxes[i])
                     
-                    # Draw bounding boxes on detection frame
-                    cv2.rectangle(detection_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    label = f"Person: {confidences[i]:.2f}"
-                    cv2.putText(detection_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    foot_point = ((x1 + x2) // 2, y2)
+                    
+                    in_zone = False
+                    if self.zone_counting_enabled and self.zones:
+                        for z in self.zones:
+                            if z[0] < foot_point[0] < z[2] and z[1] < foot_point[1] < z[3]:
+                                in_zone = True
+                                break
+                    else:
+                        in_zone = True # If zone counting disabled, count all people
+
+                    if in_zone:
+                        people_in_zones += 1
+                        # Draw bounding boxes on detection frame only for people in zones (or all if disabled)
+                        cv2.rectangle(detection_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        label = f"Person: {confidences[i]:.2f}"
+                        cv2.putText(detection_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            current_people_count = people_in_zones if self.zone_counting_enabled and self.zones else all_people_count
+            crowd_percentage = (current_people_count / self.max_people) * 100 if self.max_people > 0 else 0
+            
+            # Update peak density
+            if crowd_percentage > self.peak_density:
+                self.peak_density = crowd_percentage
             
             self.heatmap *= self.heatmap_decay
             
@@ -119,24 +144,17 @@ class VideoThread(QThread):
             
             overlay_alpha = 0.4
             heatmap_frame = cv2.addWeighted(heatmap_color, overlay_alpha, frame, 1 - overlay_alpha, 0)
-
-            # --- Mini Map / Grid Density Map ---
-            grid_size = 8
-            h, w = self.heatmap.shape
-            cell_h, cell_w = h // grid_size, w // grid_size
-            grid_density = np.zeros((grid_size, grid_size), dtype=np.float32)
-            for i in range(grid_size):
-                for j in range(grid_size):
-                    y1, y2 = i * cell_h, (i + 1) * cell_h if i < grid_size - 1 else h
-                    x1, x2 = j * cell_w, (j + 1) * cell_w if j < grid_size - 1 else w
-                    cell = self.heatmap[y1:y2, x1:x2]
-                    grid_density[i, j] = np.mean(cell)
             
             # Add count and stats to all frames
             overcrowd = crowd_percentage > self.overcrowd_thresh
             if overcrowd:
                 self.alerts_triggered += 1
                 
+            # Draw zones on frames
+            for display_frame in [detection_frame, heatmap_frame]:
+                for z in self.zones:
+                    cv2.rectangle(display_frame, (z[0], z[1]), (z[2], z[3]), (255, 0, 0), 2)
+
             # Add stats text to detection and heatmap frames
             for display_frame in [detection_frame, heatmap_frame]:
                 if overcrowd:
@@ -156,10 +174,9 @@ class VideoThread(QThread):
             prev_time = curr_time
             
             # Send all three frames to GUI
-            self.change_pixmap_signal.emit(
-                original_frame, detection_frame, heatmap_frame, 
-                current_people_count, crowd_percentage, fps, overcrowd, 
-                self.peak_density, self.alerts_triggered, grid_density.tolist())
+            self.change_pixmap_signal.emit(original_frame, detection_frame, heatmap_frame, 
+                                         current_people_count, crowd_percentage, fps, overcrowd, 
+                                         self.peak_density, self.alerts_triggered)
             self.msleep(10)
             
         cap.release()
@@ -186,6 +203,45 @@ class ClickableLabel(QLabel):
         if event.button() == Qt.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)
+
+class DrawableLabel(QLabel):
+    new_zone = pyqtSignal(QRect)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._is_drawing = False
+        self._start_point = QPoint()
+        self._end_point = QPoint()
+        self.setCursor(Qt.CrossCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._is_drawing = True
+            self._start_point = event.pos()
+            self._end_point = event.pos()
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._is_drawing:
+            self._end_point = event.pos()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._is_drawing:
+            self._is_drawing = False
+            rect = QRect(self._start_point, self._end_point).normalized()
+            if rect.width() > 5 and rect.height() > 5:  # Threshold for a valid zone
+                self.new_zone.emit(rect)
+            self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._is_drawing:
+            painter = QPainter(self)
+            pen = QPen(Qt.blue, 2, Qt.DashLine)
+            painter.setPen(pen)
+            rect = QRect(self._start_point, self._end_point).normalized()
+            painter.drawRect(rect)
 
 class CrowdCountingApp(QWidget):
     def __init__(self):
@@ -251,10 +307,11 @@ class CrowdCountingApp(QWidget):
         self.heading_label.setFont(QFont('Arial', 22, QFont.Bold))
         self.heading_label.setStyleSheet('color: #f0f0f0; margin-left: 20px;')
         # Main video display
-        self.video_label = QLabel(self)
+        self.video_label = DrawableLabel(self)
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setMinimumSize(800, 600)
         self.video_label.setStyleSheet("border: 2px solid #333333; background-color: black;")
+        self.video_label.new_zone.connect(self.add_zone)
         
         # Mode preview thumbnails
         self.normal_thumb = ClickableLabel()
@@ -277,6 +334,8 @@ class CrowdCountingApp(QWidget):
         
         self.fps_toggle = QCheckBox('Light Mode (FPS Optimized)')
         self.fps_toggle.setChecked(False)
+        self.live_btn = QPushButton('Live Mode')
+        self.live_btn.clicked.connect(self.live_mode)
         
         # Stats display
         self.stats_label = QLabel('Stats will appear here')
@@ -287,6 +346,17 @@ class CrowdCountingApp(QWidget):
         self.count_label = QLabel('Current Count: 0')
         self.peak_label = QLabel('Peak Density: 0.00%')
         self.alerts_label = QLabel('Alerts Triggered: 0')
+        self.zone_count_label = QLabel('People in Zones: 0')
+
+        # --- Time-Series Chart ---
+        self.figure = Figure(figsize=(3, 2.5))
+        self.canvas = FigureCanvas(self.figure)
+        self.ax = self.figure.add_subplot(111)
+        self.ax.set_title('People Count vs Time')
+        self.ax.set_xlabel('Time')
+        self.ax.set_ylabel('Count')
+        self.time_series_data = []  # List of (timestamp, count)
+        self.max_points = 60  # Show last 60 points (e.g., seconds)
         
         # --- Map Settings ---
         self.map_settings_group = QGroupBox('Map Settings')
@@ -303,16 +373,30 @@ class CrowdCountingApp(QWidget):
         map_settings_layout.addRow(self.update_map_btn)
         self.map_settings_group.setLayout(map_settings_layout)
 
+        # --- Zone Controls ---
+        self.zone_controls_group = QGroupBox('Zone Controls')
+        self.enable_zone_checkbox = QCheckBox('Enable Zone Counting')
+        self.clear_zones_btn = QPushButton('Clear All Zones')
+        self.clear_zones_btn.clicked.connect(self.clear_zones)
+        
+        zone_layout = QVBoxLayout()
+        zone_layout.addWidget(self.enable_zone_checkbox)
+        zone_layout.addWidget(self.clear_zones_btn)
+        self.zone_controls_group.setLayout(zone_layout)
+
         self.minimap_view = QWebEngineView()
-        self.minimap_view.setFixedSize(450,400)
+        self.minimap_view.setFixedSize(500, 350)
 
         dash_layout = QFormLayout()
         dash_layout.addRow(self.count_label)
         dash_layout.addRow(self.peak_label)
         dash_layout.addRow(self.alerts_label)
+        dash_layout.addRow(self.zone_count_label)
         dash_layout.addRow(self.map_settings_group)
+        dash_layout.addRow(self.zone_controls_group)
         dash_layout.addRow(QLabel("Live Density Map:"))
         dash_layout.addRow(self.minimap_view)
+        dash_layout.addRow(self.canvas)  # Move chart to the bottom
         self.dashboard.setLayout(dash_layout)
         
         # Connect signals
@@ -328,6 +412,7 @@ class CrowdCountingApp(QWidget):
         self.thread = None
         self.current_frames = [None, None, None]  # normal, detection, heatmap
         self.current_mode = 1  # Default to detection mode
+        self.zones = []
         # Loading animation/message state
         self.loading_timer = None
         self.loading_shown = False
@@ -393,6 +478,7 @@ class CrowdCountingApp(QWidget):
         btn_layout.addWidget(self.start_btn)
         btn_layout.addWidget(self.stop_btn)
         btn_layout.addWidget(self.fps_toggle)
+        btn_layout.addWidget(self.live_btn)
         btn_layout.addStretch()
         left_layout.addLayout(btn_layout)
         
@@ -414,9 +500,44 @@ class CrowdCountingApp(QWidget):
             self.stats_label.setText(f'Loaded: {fname}')
             self.start_video()  # Auto-start after selecting video
 
+    def live_mode(self):
+        # Use custom dialog for source selection
+        dialog = LiveSourceDialog(self)
+        choice, ok = dialog.get_choice()
+        if not ok or not choice:
+            return
+        if choice == "Webcam":
+            # Try webcam indices 0, 1, 2
+            found = False
+            for idx in range(3):
+                cap = cv2.VideoCapture(idx)
+                ret, _ = cap.read()
+                cap.release()
+                if ret:
+                    self.video_path = idx
+                    self.stats_label.setText(f'Live: Webcam (index {idx})')
+                    self.start_video()
+                    found = True
+                    break
+            if not found:
+                QMessageBox.warning(self, "No Webcam Found", "No available webcam was detected.")
+        elif choice == "RTSP Stream":
+            while True:
+                dialog2 = RTSPInputDialog(self)
+                url, ok2 = dialog2.get_url()
+                if not ok2 or not url:
+                    return
+                if url.lower().startswith("rtsp://"):
+                    self.video_path = url
+                    self.stats_label.setText(f'Live: RTSP {url}')
+                    self.start_video()
+                    break
+                else:
+                    QMessageBox.warning(self, "Invalid RTSP URL", "Please enter a valid RTSP URL starting with rtsp://")
+
     def start_video(self):
-        if not self.video_path:
-            self.stats_label.setText('Please select a video file first!')
+        if self.video_path is None or self.video_path == '':
+            self.stats_label.setText('Please select a video file or live source first!')
             return
 
         # --- Leaflet Map Setup ---
@@ -453,6 +574,7 @@ class CrowdCountingApp(QWidget):
         map_path = os.path.abspath('leaflet_map.html')
         self.minimap_view.setUrl(QUrl.fromLocalFile(map_path))
         
+        # Use a lambda to avoid issues with loop variables in closures
         self.minimap_view.loadFinished.connect(
             lambda: self.setup_map_and_start_thread(lat, lon, bounds)
         )
@@ -479,7 +601,8 @@ class CrowdCountingApp(QWidget):
         self.loading_timer.timeout.connect(self.show_loading_message)
         self.loading_timer.start(500)  # 0.5 seconds
         light_mode = self.fps_toggle.isChecked()
-        self.thread = VideoThread(self.video_path, light_mode=light_mode)
+        zones_enabled = self.enable_zone_checkbox.isChecked()
+        self.thread = VideoThread(self.video_path, light_mode=light_mode, zones=self.zones, zone_counting_enabled=zones_enabled)
         self.thread.change_pixmap_signal.connect(self.update_frames)
         self.thread.start()
         self.start_btn.setEnabled(False)
@@ -511,6 +634,54 @@ class CrowdCountingApp(QWidget):
             self.thread.stop()
         event.accept()
 
+    def add_zone(self, rect: QRect):
+        # The rect from DrawableLabel is in widget coordinates.
+        # It needs to be scaled to the original video frame coordinates.
+        if self.current_frames[0] is None:
+            return
+        frame_h, frame_w, _ = self.current_frames[0].shape
+        label_w = self.video_label.width()
+        label_h = self.video_label.height()
+        pixmap = self.video_label.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return
+        pixmap_w = pixmap.width()
+        pixmap_h = pixmap.height()
+        offset_x = (label_w - pixmap_w) / 2
+        offset_y = (label_h - pixmap_h) / 2
+        # Translate from label coordinates to pixmap coordinates
+        px1 = rect.left() - offset_x
+        py1 = rect.top() - offset_y
+        px2 = rect.right() - offset_x
+        py2 = rect.bottom() - offset_y
+        # Scale from pixmap coordinates to original frame coordinates
+        scale_w = frame_w / pixmap_w
+        scale_h = frame_h / pixmap_h
+        fx1 = int(px1 * scale_w)
+        fy1 = int(py1 * scale_h)
+        fx2 = int(px2 * scale_w)
+        fy2 = int(py2 * scale_h)
+        # Clamp to frame dimensions and add if valid
+        fx1, fx2 = sorted((max(0, min(fx1, frame_w)), max(0, min(fx2, frame_w))))
+        fy1, fy2 = sorted((max(0, min(fy1, frame_h)), max(0, min(fy2, frame_h))))
+        if fx2 > fx1 and fy2 > fy1:
+            self.zones.append((fx1, fy1, fx2, fy2))
+        # Restart video to update zone-based counting
+        self.restart_video_with_zones()
+
+    def clear_zones(self):
+        self.zones.clear()
+        # Restart video to update zone-based counting
+        self.restart_video_with_zones()
+
+    def restart_video_with_zones(self):
+        # Stop and restart the video thread with the current zones
+        if self.thread:
+            self.thread.stop()
+            self.thread = None
+        if self.video_path:
+            self.start_video()
+
     def update_frames(self, normal_frame, detection_frame, heatmap_frame, count, percent, fps, overcrowd, peak_density, alerts_triggered):
         # First frame received, stop loading message
         self.first_frame_received = True
@@ -533,6 +704,28 @@ class CrowdCountingApp(QWidget):
         self.count_label.setText(f'Current Count: {count}')
         self.peak_label.setText(f'Peak Density: {peak_density:.2f}%')
         self.alerts_label.setText(f'Alerts Triggered: {alerts_triggered}')
+        # Update zone count label
+        if self.enable_zone_checkbox.isChecked() and self.zones:
+            self.zone_count_label.setText(f'People in Zones: {count}')
+        else:
+            self.zone_count_label.setText('People in Zones: -')
+        # Update time-series chart
+        now = datetime.datetime.now()
+        self.time_series_data.append((now, count))
+        # Keep only the last 10 seconds
+        self.time_series_data = [(t, c) for t, c in self.time_series_data if (now - t).total_seconds() <= 10]
+        if len(self.time_series_data) == 0:
+            return
+        times, counts = zip(*self.time_series_data)
+        time_labels = [t.strftime('%H:%M:%S') for t in times]
+        self.ax.clear()
+        self.ax.plot(time_labels, counts, color='tab:blue', linewidth=2)
+        self.ax.set_title('People Count vs Time (last 10s)')
+        self.ax.set_xlabel('Time')
+        self.ax.set_ylabel('Count')
+        self.ax.tick_params(axis='x', labelrotation=45)
+        self.figure.tight_layout()
+        self.canvas.draw()
         # No minimap overlay update needed
 
     def update_thumbnail(self, label, cv_img):
@@ -546,7 +739,15 @@ class CrowdCountingApp(QWidget):
 
     def update_main_display(self):
         if self.current_frames[self.current_mode] is not None:
-            cv_img = self.current_frames[self.current_mode]
+            cv_img = self.current_frames[self.current_mode].copy()
+            # --- Add semi-transparent black overlay for zones if enabled ---
+            if self.enable_zone_checkbox.isChecked() and self.zones:
+                overlay = cv_img.copy()
+                for z in self.zones:
+                    x1, y1, x2, y2 = z
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), thickness=-1)
+                alpha = 0.35  # Transparency factor
+                cv_img = cv2.addWeighted(overlay, alpha, cv_img, 1 - alpha, 0)
             rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_image.shape
             bytes_per_line = ch * w
@@ -563,6 +764,52 @@ class CrowdCountingApp(QWidget):
             return
         self.minimap_view.page().runJavaScript(f"initializeMap({lat}, {lon}, 17);")
         self.minimap_view.page().runJavaScript(f"showCoverageCircle({lat}, {lon}, {width_meters});")
+
+class LiveSourceDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Live Mode")
+        self.setMinimumWidth(350)
+        self.setMinimumHeight(180)
+        layout = QVBoxLayout(self)
+        label = QLabel("Select source:")
+        label.setStyleSheet("font-size: 16px; margin-bottom: 10px;")
+        layout.addWidget(label)
+        self.combo = QComboBox()
+        self.combo.addItems(["Webcam", "RTSP Stream"])
+        self.combo.setStyleSheet("font-size: 15px; padding: 4px;")
+        layout.addWidget(self.combo)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+    def get_choice(self):
+        if self.exec_() == QDialog.Accepted:
+            return self.combo.currentText(), True
+        return None, False
+
+class RTSPInputDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("RTSP Stream")
+        self.setMinimumWidth(420)
+        self.setMinimumHeight(180)
+        layout = QVBoxLayout(self)
+        label = QLabel("Enter RTSP URL:")
+        label.setStyleSheet("font-size: 16px; margin-bottom: 10px;")
+        layout.addWidget(label)
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("rtsp://...")
+        self.input.setStyleSheet("font-size: 15px; padding: 4px;")
+        layout.addWidget(self.input)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+    def get_url(self):
+        if self.exec_() == QDialog.Accepted:
+            return self.input.text().strip(), True
+        return None, False
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
